@@ -1,18 +1,15 @@
-// roblox-up-and-coming-forecast-01: a momentum-adjusted rank forecast of the
-// Up-and-Coming chart's top 10, written from scratch.
+// roblox-up-and-coming-forecast-01 — momentum-adjusted rank forecast.
 //
-// The chart moves several times a day as new games climb it and older ones age
-// out, so a forecast that freezes the chart as it stood (the house baseline)
-// loses the places that move. This entry instead estimates each candidate's
-// recent rank velocity (momentum) from the whole history, extrapolates it over
-// the scored window's midpoint, bends it with player-count growth, and turns
-// the resulting adjusted ranks into a place-by-game probability matrix with a
-// Gaussian kernel around each place. A reserve is left unnamed at every place
-// for games the history never named.
+// Rewritten from scratch. Read the snapshot history, estimate each candidate
+// game's recency-weighted rank velocity (momentum), extrapolate it to the
+// scored window's midpoint, blend in player-count growth, then turn the
+// adjusted ranks into a per-place probability matrix over the chart's top
+// places. A fixed share of every place is reserved for games the history
+// never named. Node standard library only, no network, fully deterministic.
 //
-// Node 22+ standard library only, no network. Reads $MAKEFUN_INPUT_DIR (or
-// /input), writes $MAKEFUN_OUTPUT_DIR (or /output)/forecast.json:
-//   {"probabilities": [{"universe_id", "place", "p"}...], "top10": [10 ids]}
+// Reads $MAKEFUN_INPUT_DIR (default /input), writes $MAKEFUN_OUTPUT_DIR
+// (default /output)/<task.output>:
+//   {"probabilities":[{"universe_id","place","p"}], "top10":[10 ids]}
 
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
@@ -21,11 +18,13 @@ const IDIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const ODIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
 const DAY_MS = 86_400_000;
-/** Time constant (days) of the exponential recency weight on rank deltas. */
-const MOMENTUM_DECAY_DAYS = 3.5;
-/** Std-dev (chart places) of the Gaussian place kernel at zero horizon. */
+
+// ---- model constants ----
+/** Recency time-constant (days) on rank deltas used to weight momentum. */
+const MOMENTUM_DECAY_DAYS = 2.0;
+/** Std-dev (chart places) of the place kernel at zero horizon. */
 const SIGMA_FLOOR = 2.0;
-/** How fast the kernel widens per day of extrapolation. */
+/** How fast the place kernel widens per day of extrapolation. */
 const SIGMA_PER_DAY = 1.5;
 /** Share of each place left unnamed, for games the history never named. */
 const NEWCOMER_RESERVE = 0.2;
@@ -34,6 +33,10 @@ const MIN_P = 0.0005;
 /** Most candidate games considered, and most rows a single place may hold. */
 const CANDIDATES = 100;
 const MAX_ROWS_PER_PLACE = 100;
+/** Hard clamp (chart places) on an extrapolated rank shift. */
+const MAX_RANK_SHIFT = 25;
+/** Observations needed before a game's extrapolation is fully trusted. */
+const TRUST_OBS = 8;
 
 interface Row {
   rank: number;
@@ -58,7 +61,6 @@ interface Game {
   ranks: number[];
   playing: number[];
   lastRank: number;
-  lastPlaying: number;
   momentum: number;
   playGrowth: number;
   adjRank: number;
@@ -69,10 +71,10 @@ const places = task.places;
 const outName = task.output;
 
 // Valid reads only, oldest first, so momentum has a stable sign.
-const snaps = readFileSync(join(IDIR, 'history.ndjson'), 'utf8')
+const snaps: Snapshot[] = readFileSync(join(IDIR, 'history.ndjson'), 'utf8')
   .split('\n')
-  .filter((l) => l.length > 0)
-  .map((l) => JSON.parse(l) as Snapshot)
+  .filter((line) => line.trim().length > 0)
+  .map((line) => JSON.parse(line) as Snapshot)
   .filter((s) => s.ok === true && Array.isArray(s.up_and_coming) && s.up_and_coming.length > 0)
   .sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
 
@@ -89,19 +91,17 @@ for (const snap of snaps) {
         ranks: [],
         playing: [],
         lastRank: 9999,
-        lastPlaying: 0,
         momentum: 0,
         playGrowth: 0,
         adjRank: 9999,
       };
       gameMap.set(row.universe_id, g);
     }
-    const p = row.playing ?? 0;
     g.times.push(t);
     g.ranks.push(row.rank);
-    g.playing.push(p);
+    g.playing.push(row.playing ?? 0);
     g.lastRank = row.rank;
-    g.lastPlaying = p;
+    if (row.name) g.name = row.name;
   }
 }
 
@@ -135,13 +135,9 @@ const tLast = snaps.length > 0 ? Date.parse(snaps[snaps.length - 1].at) : winFro
 const horizonDays = (winMid - tLast) / DAY_MS;
 
 // Candidates: the games nearest the top of the last chart, by last rank.
-const top = [...gameMap.values()]
-  .sort((a, b) => a.lastRank - b.lastRank)
+const top: Game[] = [...gameMap.values()]
+  .sort((a, b) => a.lastRank - b.lastRank || a.uid - b.uid)
   .slice(0, Math.min(CANDIDATES, gameMap.size));
-
-/** Hard clamp (chart places) on an extrapolated shift, so one noisy read mid-history
- *  cannot fling a game across the chart. */
-const MAX_RANK_SHIFT = 25;
 
 for (const g of top) {
   const rawShift = g.momentum * horizonDays;
@@ -151,7 +147,7 @@ for (const g of top) {
   const playBonus = Math.min(3, Math.max(-3, -g.playGrowth * 2));
   // Trust the extrapolation only as far as the history supports it: a game seen
   // in few reads keeps more of its last known rank instead of a noisy velocity.
-  const trust = Math.min(1, g.ranks.length / 8);
+  const trust = Math.min(1, g.ranks.length / TRUST_OBS);
   const adj = g.lastRank + trust * (rankShift + playBonus * 0.5);
   // Guard the final rank: never non-finite, never above place 1.
   g.adjRank = Number.isFinite(adj) ? Math.max(1, adj) : g.lastRank;
@@ -166,15 +162,19 @@ for (let place = 1; place <= places; place++) {
   const wSum = ws.reduce((a, b) => a + b, 0);
   let rows = 0;
   for (let i = 0; i < top.length && rows < MAX_ROWS_PER_PLACE; i++) {
-    const p = wSum > 0 ? (namedBudget * ws[i]) / wSum : 0;
-    if (p < MIN_P) continue;
+    let p = wSum > 0 ? (namedBudget * ws[i]) / wSum : 0;
+    // Confidence scaling: a game the history barely observed gets a damped share.
+    const conf = Math.min(1, top[i].ranks.length / TRUST_OBS);
+    p *= conf;
+    // Guard: emit only finite, strictly positive rows.
+    if (!Number.isFinite(p) || p <= 0 || p < MIN_P) continue;
     probabilities.push({ universe_id: top[i].uid, place, p: Math.floor(p * 1e6) / 1e6 });
     rows++;
   }
 }
 
 const top10 = [...top]
-  .sort((a, b) => a.adjRank - b.adjRank)
+  .sort((a, b) => a.adjRank - b.adjRank || a.uid - b.uid)
   .slice(0, 10)
   .map((g) => g.uid);
 
